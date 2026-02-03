@@ -3,8 +3,8 @@ name: Images to ZIP
 on:
   workflow_dispatch:
     inputs:
-      images_json:
-        description: 'JSON array of image URLs'
+      images_base64:
+        description: 'Base64 encoded JSON array of image URLs'
         required: true
       folder_name:
         description: 'Output folder name'
@@ -22,7 +22,7 @@ jobs:
     steps:
       - name: Download images and create ZIP
         env:
-          IMAGES_JSON: ${{ github.event.inputs.images_json }}
+          IMAGES_BASE64: ${{ github.event.inputs.images_base64 }}
           FOLDER_NAME: ${{ github.event.inputs.folder_name }}
           CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
@@ -32,6 +32,7 @@ jobs:
           python3 << 'EOF'
           import os
           import json
+          import base64
           import requests
           import zipfile
           import concurrent.futures
@@ -39,11 +40,13 @@ jobs:
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          IMAGES_JSON = os.environ['IMAGES_JSON']
+          # Декодируем base64
+          IMAGES_BASE64 = os.environ['IMAGES_BASE64']
+          images = json.loads(base64.b64decode(IMAGES_BASE64).decode('utf-8'))
+          
           FOLDER_NAME = os.environ.get('FOLDER_NAME', 'export')
           CALLBACK_URL = os.environ.get('CALLBACK_URL', '')
 
-          images = json.loads(IMAGES_JSON)
           print(f"Processing {len(images)} images...")
 
           def download_image(item):
@@ -67,6 +70,8 @@ jobs:
                           ext = '.svg'
                       
                       filename = f"{name}_{img_type}{ext}"
+                      # Убираем недопустимые символы из имени файла
+                      filename = "".join(c for c in filename if c.isalnum() or c in '._- ').strip()
                       return (filename, r.content)
               except Exception as e:
                   print(f"Error downloading {name}: {e}")
@@ -79,7 +84,14 @@ jobs:
               results = list(executor.map(download_image, images))
               downloaded = [r for r in results if r is not None]
 
-          print(f"Downloaded {len(downloaded)} images")
+          print(f"Downloaded {len(downloaded)} of {len(images)} images")
+
+          if len(downloaded) == 0:
+              print("ERROR: No images downloaded!")
+              result = {'success': False, 'error': 'No images downloaded'}
+              if CALLBACK_URL:
+                  requests.post(CALLBACK_URL, json=result, timeout=30)
+              exit(1)
 
           # Создать ZIP
           zip_path = f'/tmp/{FOLDER_NAME}.zip'
@@ -92,63 +104,76 @@ jobs:
           print(f"ZIP created: {zip_size / 1024 / 1024:.2f} MB")
 
           # Загрузить на Google Drive
-          result = {'success': False}
+          result = {'success': False, 'error': 'No Google credentials'}
           
           creds_json = os.environ.get('GOOGLE_CREDENTIALS')
           if creds_json:
               print("Uploading to Google Drive...")
-              creds_dict = json.loads(creds_json)
-              creds = service_account.Credentials.from_service_account_info(
-                  creds_dict,
-                  scopes=['https://www.googleapis.com/auth/drive.file']
-              )
-              drive = build('drive', 'v3', credentials=creds)
-              
-              file_metadata = {'name': f'{FOLDER_NAME}.zip'}
-              media = MediaFileUpload(zip_path, mimetype='application/zip')
-              file = drive.files().create(
-                  body=file_metadata, 
-                  media_body=media, 
-                  fields='id,webViewLink'
-              ).execute()
-              
-              # Сделать публичным
-              drive.permissions().create(
-                  fileId=file['id'],
-                  body={'type': 'anyone', 'role': 'reader'}
-              ).execute()
-              
-              download_url = f"https://drive.google.com/uc?export=download&id={file['id']}"
-              
-              result = {
-                  'success': True,
-                  'downloadUrl': download_url,
-                  'viewUrl': file['webViewLink'],
-                  'filesCount': len(downloaded),
-                  'fileSize': zip_size,
-                  'fileSizeMB': round(zip_size / 1024 / 1024, 2)
-              }
-              
-              print(f"Uploaded! Download: {download_url}")
+              try:
+                  creds_dict = json.loads(creds_json)
+                  creds = service_account.Credentials.from_service_account_info(
+                      creds_dict,
+                      scopes=['https://www.googleapis.com/auth/drive.file']
+                  )
+                  drive = build('drive', 'v3', credentials=creds)
+                  
+                  file_metadata = {'name': f'{FOLDER_NAME}.zip'}
+                  media = MediaFileUpload(zip_path, mimetype='application/zip', resumable=True)
+                  file = drive.files().create(
+                      body=file_metadata, 
+                      media_body=media, 
+                      fields='id,webViewLink'
+                  ).execute()
+                  
+                  # Сделать публичным
+                  drive.permissions().create(
+                      fileId=file['id'],
+                      body={'type': 'anyone', 'role': 'reader'}
+                  ).execute()
+                  
+                  download_url = f"https://drive.google.com/uc?export=download&id={file['id']}"
+                  
+                  result = {
+                      'success': True,
+                      'downloadUrl': download_url,
+                      'viewUrl': file['webViewLink'],
+                      'filesCount': len(downloaded),
+                      'totalFiles': len(images),
+                      'fileSize': zip_size,
+                      'fileSizeMB': round(zip_size / 1024 / 1024, 2)
+                  }
+                  
+                  print(f"Uploaded! Download: {download_url}")
+                  
+              except Exception as e:
+                  print(f"Google Drive error: {e}")
+                  result = {'success': False, 'error': str(e)}
+          else:
+              print("No Google credentials provided")
 
           # Отправить callback
           if CALLBACK_URL:
               try:
                   requests.post(CALLBACK_URL, json=result, timeout=30)
-                  print("Callback sent")
+                  print("Callback sent successfully")
               except Exception as e:
                   print(f"Callback error: {e}")
 
-          # Сохранить для артефакта
-          with open('/tmp/result.json', 'w') as f:
-              json.dump(result, f)
-              
+          # Вывести результат
+          print("\n=== RESULT ===")
           print(json.dumps(result, indent=2))
+          
+          # Записать в GitHub output
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              f.write(f"result={json.dumps(result)}\n")
+              
           EOF
 
-      - name: Upload artifact
+      - name: Upload artifact (backup)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: images-zip
           path: /tmp/*.zip
           retention-days: 1
+          if-no-files-found: ignore
