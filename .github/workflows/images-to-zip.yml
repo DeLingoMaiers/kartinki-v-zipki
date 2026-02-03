@@ -3,16 +3,13 @@ name: Images to ZIP
 on:
   workflow_dispatch:
     inputs:
-      gist_url:
-        description: 'URL to JSON file with image list'
+      gist_id:
+        description: 'Gist ID to read images and write result'
         required: true
       folder_name:
         description: 'Output folder name'
         required: false
         default: 'export'
-      callback_url:
-        description: 'Webhook URL for result'
-        required: false
 
 jobs:
   create-zip:
@@ -22,11 +19,10 @@ jobs:
     steps:
       - name: Download images and create ZIP
         env:
-          GIST_URL: ${{ github.event.inputs.gist_url }}
+          GIST_ID: ${{ github.event.inputs.gist_id }}
           FOLDER_NAME: ${{ github.event.inputs.folder_name }}
-          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           pip install requests google-auth google-api-python-client
 
@@ -40,22 +36,21 @@ jobs:
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          # Скачиваем JSON из Gist
-          GIST_URL = os.environ['GIST_URL']
-          GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
-          
-          headers = {}
-          if GITHUB_TOKEN:
-              headers['Authorization'] = f'token {GITHUB_TOKEN}'
-          
-          print(f"Fetching images list from: {GIST_URL}")
-          resp = requests.get(GIST_URL, headers=headers, timeout=30)
-          resp.raise_for_status()
-          images = json.loads(resp.text)
-          
+          GIST_ID = os.environ['GIST_ID']
+          GH_TOKEN = os.environ['GH_TOKEN']
           FOLDER_NAME = os.environ.get('FOLDER_NAME', 'export')
-          CALLBACK_URL = os.environ.get('CALLBACK_URL', '')
+          
+          headers = {'Authorization': f'token {GH_TOKEN}'}
 
+          # Читаем images.json из Gist
+          print(f"Fetching Gist: {GIST_ID}")
+          gist_resp = requests.get(f'https://api.github.com/gists/{GIST_ID}', headers=headers)
+          gist_resp.raise_for_status()
+          gist_data = gist_resp.json()
+          
+          images_content = gist_data['files']['images.json']['content']
+          images = json.loads(images_content)
+          
           print(f"Processing {len(images)} images...")
 
           def download_image(item):
@@ -93,72 +88,81 @@ jobs:
 
           print(f"Downloaded {len(downloaded)} of {len(images)} images")
 
+          result = {'success': False, 'status': 'failed'}
+
           if len(downloaded) == 0:
-              print("ERROR: No images downloaded!")
-              result = {'success': False, 'error': 'No images downloaded'}
-              if CALLBACK_URL:
-                  requests.post(CALLBACK_URL, json=result, timeout=30)
-              exit(1)
+              result = {'success': False, 'error': 'No images downloaded', 'status': 'failed'}
+          else:
+              zip_path = f'/tmp/{FOLDER_NAME}.zip'
+              print("Creating ZIP...")
+              with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                  for filename, content in downloaded:
+                      zf.writestr(filename, content)
 
-          zip_path = f'/tmp/{FOLDER_NAME}.zip'
-          print("Creating ZIP...")
-          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-              for filename, content in downloaded:
-                  zf.writestr(filename, content)
+              zip_size = os.path.getsize(zip_path)
+              print(f"ZIP created: {zip_size / 1024 / 1024:.2f} MB")
 
-          zip_size = os.path.getsize(zip_path)
-          print(f"ZIP created: {zip_size / 1024 / 1024:.2f} MB")
+              creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+              if creds_json:
+                  print("Uploading to Google Drive...")
+                  try:
+                      creds_dict = json.loads(creds_json)
+                      creds = service_account.Credentials.from_service_account_info(
+                          creds_dict,
+                          scopes=['https://www.googleapis.com/auth/drive.file']
+                      )
+                      drive = build('drive', 'v3', credentials=creds)
+                      
+                      file_metadata = {'name': f'{FOLDER_NAME}.zip'}
+                      media = MediaFileUpload(zip_path, mimetype='application/zip', resumable=True)
+                      file = drive.files().create(
+                          body=file_metadata, 
+                          media_body=media, 
+                          fields='id,webViewLink'
+                      ).execute()
+                      
+                      drive.permissions().create(
+                          fileId=file['id'],
+                          body={'type': 'anyone', 'role': 'reader'}
+                      ).execute()
+                      
+                      download_url = f"https://drive.google.com/uc?export=download&id={file['id']}"
+                      
+                      result = {
+                          'success': True,
+                          'status': 'completed',
+                          'downloadUrl': download_url,
+                          'viewUrl': file['webViewLink'],
+                          'filesCount': len(downloaded),
+                          'totalFiles': len(images),
+                          'fileSize': zip_size,
+                          'fileSizeMB': round(zip_size / 1024 / 1024, 2)
+                      }
+                      
+                      print(f"Uploaded! Download: {download_url}")
+                      
+                  except Exception as e:
+                      print(f"Google Drive error: {e}")
+                      result = {'success': False, 'status': 'failed', 'error': str(e)}
 
-          result = {'success': False, 'error': 'No Google credentials'}
-          
-          creds_json = os.environ.get('GOOGLE_CREDENTIALS')
-          if creds_json:
-              print("Uploading to Google Drive...")
-              try:
-                  creds_dict = json.loads(creds_json)
-                  creds = service_account.Credentials.from_service_account_info(
-                      creds_dict,
-                      scopes=['https://www.googleapis.com/auth/drive.file']
-                  )
-                  drive = build('drive', 'v3', credentials=creds)
-                  
-                  file_metadata = {'name': f'{FOLDER_NAME}.zip'}
-                  media = MediaFileUpload(zip_path, mimetype='application/zip', resumable=True)
-                  file = drive.files().create(
-                      body=file_metadata, 
-                      media_body=media, 
-                      fields='id,webViewLink'
-                  ).execute()
-                  
-                  drive.permissions().create(
-                      fileId=file['id'],
-                      body={'type': 'anyone', 'role': 'reader'}
-                  ).execute()
-                  
-                  download_url = f"https://drive.google.com/uc?export=download&id={file['id']}"
-                  
-                  result = {
-                      'success': True,
-                      'downloadUrl': download_url,
-                      'viewUrl': file['webViewLink'],
-                      'filesCount': len(downloaded),
-                      'totalFiles': len(images),
-                      'fileSize': zip_size,
-                      'fileSizeMB': round(zip_size / 1024 / 1024, 2)
+          # Сохраняем результат в тот же Gist
+          print("Saving result to Gist...")
+          update_resp = requests.patch(
+              f'https://api.github.com/gists/{GIST_ID}',
+              headers=headers,
+              json={
+                  'files': {
+                      'result.json': {
+                          'content': json.dumps(result, indent=2)
+                      }
                   }
-                  
-                  print(f"Uploaded! Download: {download_url}")
-                  
-              except Exception as e:
-                  print(f"Google Drive error: {e}")
-                  result = {'success': False, 'error': str(e)}
-
-          if CALLBACK_URL:
-              try:
-                  requests.post(CALLBACK_URL, json=result, timeout=30)
-                  print("Callback sent")
-              except Exception as e:
-                  print(f"Callback error: {e}")
+              }
+          )
+          
+          if update_resp.status_code == 200:
+              print("Result saved to Gist")
+          else:
+              print(f"Failed to update Gist: {update_resp.status_code}")
 
           print("\n=== RESULT ===")
           print(json.dumps(result, indent=2))
