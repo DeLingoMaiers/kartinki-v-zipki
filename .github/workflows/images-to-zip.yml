@@ -23,8 +23,6 @@ jobs:
           FOLDER_NAME: ${{ github.event.inputs.folder_name }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          pip install requests
-
           python3 << 'EOF'
           import os
           import json
@@ -82,120 +80,61 @@ jobs:
 
           print(f"Downloaded {len(downloaded)} of {len(images)} images")
 
-          if len(downloaded) == 0:
-              result = {'success': False, 'error': 'No images downloaded', 'status': 'failed'}
-              
-              requests.patch(
-                  f'https://api.github.com/gists/{GIST_ID}',
-                  headers=headers,
-                  json={'files': {'result.json': {'content': json.dumps(result)}}}
-              )
-              exit(1)
-
           zip_path = f'/tmp/{FOLDER_NAME}.zip'
-          print("Creating ZIP...")
-          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-              for filename, content in downloaded:
-                  zf.writestr(filename, content)
+          
+          if len(downloaded) > 0:
+              print("Creating ZIP...")
+              with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                  for filename, content in downloaded:
+                      zf.writestr(filename, content)
 
-          zip_size = os.path.getsize(zip_path)
-          print(f"ZIP created: {zip_size / 1024 / 1024:.2f} MB")
-
-          # Сохраняем путь для следующего шага
-          with open('/tmp/zip_info.json', 'w') as f:
-              json.dump({
-                  'zip_path': zip_path,
-                  'zip_size': zip_size,
-                  'files_count': len(downloaded),
-                  'total_files': len(images),
-                  'folder_name': FOLDER_NAME
-              }, f)
+              zip_size = os.path.getsize(zip_path)
+              print(f"ZIP created: {zip_size / 1024 / 1024:.2f} MB")
+              
+              with open('/tmp/result.json', 'w') as f:
+                  json.dump({
+                      'success': True,
+                      'filesCount': len(downloaded),
+                      'totalFiles': len(images),
+                      'fileSize': zip_size,
+                      'fileSizeMB': round(zip_size / 1024 / 1024, 2)
+                  }, f)
+          else:
+              with open('/tmp/result.json', 'w') as f:
+                  json.dump({'success': False, 'error': 'No images downloaded'}, f)
           EOF
 
-      - name: Create Release and upload ZIP
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-zip
+          path: /tmp/${{ github.event.inputs.folder_name }}.zip
+          retention-days: 7
+
+      - name: Save result to Gist
         env:
           GIST_ID: ${{ github.event.inputs.gist_id }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
         run: |
           python3 << 'EOF'
           import os
           import json
           import requests
-          from datetime import datetime
 
           GIST_ID = os.environ['GIST_ID']
           GH_TOKEN = os.environ['GH_TOKEN']
+          RUN_ID = os.environ['RUN_ID']
           REPO = os.environ['REPO']
-          
-          headers = {
-              'Authorization': f'token {GH_TOKEN}',
-              'Accept': 'application/vnd.github.v3+json'
-          }
 
-          with open('/tmp/zip_info.json') as f:
-              info = json.load(f)
+          with open('/tmp/result.json') as f:
+              result = json.load(f)
 
-          zip_path = info['zip_path']
-          folder_name = info['folder_name']
-          tag_name = f"export-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-
-          print(f"Creating release: {tag_name}")
-          
-          # Создаём release
-          release_resp = requests.post(
-              f'https://api.github.com/repos/{REPO}/releases',
-              headers=headers,
-              json={
-                  'tag_name': tag_name,
-                  'name': f'Export {folder_name}',
-                  'body': f'Auto-generated export with {info["files_count"]} images',
-                  'draft': False,
-                  'prerelease': False
-              }
-          )
-          
-          if release_resp.status_code != 201:
-              print(f"Failed to create release: {release_resp.status_code} - {release_resp.text}")
-              exit(1)
-          
-          release = release_resp.json()
-          upload_url = release['upload_url'].replace('{?name,label}', '')
-          
-          print(f"Uploading ZIP to release...")
-          
-          # Загружаем ZIP
-          with open(zip_path, 'rb') as f:
-              upload_resp = requests.post(
-                  f'{upload_url}?name={folder_name}.zip',
-                  headers={
-                      'Authorization': f'token {GH_TOKEN}',
-                      'Content-Type': 'application/zip'
-                  },
-                  data=f
-              )
-          
-          if upload_resp.status_code != 201:
-              print(f"Failed to upload: {upload_resp.status_code} - {upload_resp.text}")
-              exit(1)
-          
-          asset = upload_resp.json()
-          download_url = asset['browser_download_url']
-          
-          print(f"Uploaded! URL: {download_url}")
-
-          # Сохраняем результат в Gist
-          result = {
-              'success': True,
-              'status': 'completed',
-              'downloadUrl': download_url,
-              'fileName': f'{folder_name}.zip',
-              'filesCount': info['files_count'],
-              'totalFiles': info['total_files'],
-              'fileSize': info['zip_size'],
-              'fileSizeMB': round(info['zip_size'] / 1024 / 1024, 2),
-              'releaseTag': tag_name
-          }
+          result['status'] = 'completed'
+          result['run_id'] = RUN_ID
+          result['repo'] = REPO
+          result['artifact_name'] = 'images-zip'
 
           requests.patch(
               f'https://api.github.com/gists/{GIST_ID}',
@@ -203,6 +142,5 @@ jobs:
               json={'files': {'result.json': {'content': json.dumps(result, indent=2)}}}
           )
           
-          print("Done!")
           print(json.dumps(result, indent=2))
           EOF
