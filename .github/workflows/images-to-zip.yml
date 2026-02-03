@@ -89,66 +89,24 @@ jobs:
 
               zip_size = os.path.getsize(zip_path)
               print(f"ZIP created: {zip_size / 1024 / 1024:.2f} MB")
-              
-              with open('/tmp/result.json', 'w') as f:
-                  json.dump({
-                      'success': True,
-                      'filesCount': len(downloaded),
-                      'totalFiles': len(images),
-                      'fileSize': zip_size,
-                      'fileSizeMB': round(zip_size / 1024 / 1024, 2)
-                  }, f)
           else:
-              with open('/tmp/result.json', 'w') as f:
-                  json.dump({'success': False, 'error': 'No images downloaded'}, f)
+              print("No images downloaded!")
               exit(1)
           EOF
 
       - name: Upload to R2
         env:
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          FOLDER_NAME: ${{ github.event.inputs.folder_name }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
-          pip install boto3
-          
-          python3 << 'EOF'
-          import os
-          import json
-          import boto3
-
-          FOLDER_NAME = os.environ.get('FOLDER_NAME', 'export')
-          zip_path = f'/tmp/{FOLDER_NAME}.zip'
-          r2_filename = f'{FOLDER_NAME}.zip'
-
-          s3 = boto3.client(
-              's3',
-              endpoint_url=os.environ['R2_ENDPOINT'],
-              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
-              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY']
-          )
-
-          print(f"Uploading {zip_path} to R2...")
-          s3.upload_file(zip_path, 'hevc-bucket', r2_filename, ExtraArgs={'ContentType': 'application/zip'})
-          
-          public_url = f"https://pub-4a502e89738d4faaa0974f3ed05a0594.r2.dev/{r2_filename}"
-          print(f"Uploaded: {public_url}")
-
-          with open('/tmp/result.json') as f:
-              result = json.load(f)
-          
-          result['publicUrl'] = public_url
-          result['filename'] = r2_filename
-          
-          with open('/tmp/result.json', 'w') as f:
-              json.dump(result, f)
-          EOF
+          aws s3 cp /tmp/${{ github.event.inputs.folder_name }}.zip s3://hevc-video-converter/${{ github.event.inputs.folder_name }}.zip \
+            --endpoint-url ${{ secrets.R2_ENDPOINT }}
 
       - name: Save result to Gist
         env:
           GIST_ID: ${{ github.event.inputs.gist_id }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          FOLDER_NAME: ${{ github.event.inputs.folder_name }}
         run: |
           python3 << 'EOF'
           import os
@@ -157,11 +115,18 @@ jobs:
 
           GIST_ID = os.environ['GIST_ID']
           GH_TOKEN = os.environ['GH_TOKEN']
+          FOLDER_NAME = os.environ['FOLDER_NAME']
 
-          with open('/tmp/result.json') as f:
-              result = json.load(f)
+          zip_path = f'/tmp/{FOLDER_NAME}.zip'
+          zip_size = os.path.getsize(zip_path)
 
-          result['status'] = 'completed'
+          result = {
+              'success': True,
+              'status': 'completed',
+              'publicUrl': f'https://pub-4a502e89738d4faaa0974f3ed05a0594.r2.dev/{FOLDER_NAME}.zip',
+              'filename': f'{FOLDER_NAME}.zip',
+              'fileSizeMB': round(zip_size / 1024 / 1024, 2)
+          }
 
           requests.patch(
               f'https://api.github.com/gists/{GIST_ID}',
