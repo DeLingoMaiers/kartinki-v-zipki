@@ -21,20 +21,17 @@ jobs:
         env:
           GIST_ID: ${{ github.event.inputs.gist_id }}
           FOLDER_NAME: ${{ github.event.inputs.folder_name }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          pip install requests google-auth google-api-python-client
+          pip install requests
 
           python3 << 'EOF'
           import os
           import json
+          import base64
           import requests
           import zipfile
           import concurrent.futures
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
-          from googleapiclient.http import MediaFileUpload
 
           GIST_ID = os.environ['GIST_ID']
           GH_TOKEN = os.environ['GH_TOKEN']
@@ -42,7 +39,6 @@ jobs:
           
           headers = {'Authorization': f'token {GH_TOKEN}'}
 
-          # Читаем images.json из Gist
           print(f"Fetching Gist: {GIST_ID}")
           gist_resp = requests.get(f'https://api.github.com/gists/{GIST_ID}', headers=headers)
           gist_resp.raise_for_status()
@@ -89,6 +85,7 @@ jobs:
           print(f"Downloaded {len(downloaded)} of {len(images)} images")
 
           result = {'success': False, 'status': 'failed'}
+          zip_base64 = None
 
           if len(downloaded) == 0:
               result = {'success': False, 'error': 'No images downloaded', 'status': 'failed'}
@@ -102,77 +99,42 @@ jobs:
               zip_size = os.path.getsize(zip_path)
               print(f"ZIP created: {zip_size / 1024 / 1024:.2f} MB")
 
-              creds_json = os.environ.get('GOOGLE_CREDENTIALS')
-              if creds_json:
-                  print("Uploading to Google Drive...")
-                  try:
-                      creds_dict = json.loads(creds_json)
-                      creds = service_account.Credentials.from_service_account_info(
-                          creds_dict,
-                          scopes=['https://www.googleapis.com/auth/drive.file']
-                      )
-                      drive = build('drive', 'v3', credentials=creds)
-                      
-                      file_metadata = {'name': f'{FOLDER_NAME}.zip'}
-                      media = MediaFileUpload(zip_path, mimetype='application/zip', resumable=True)
-                      file = drive.files().create(
-                          body=file_metadata, 
-                          media_body=media, 
-                          fields='id,webViewLink'
-                      ).execute()
-                      
-                      drive.permissions().create(
-                          fileId=file['id'],
-                          body={'type': 'anyone', 'role': 'reader'}
-                      ).execute()
-                      
-                      download_url = f"https://drive.google.com/uc?export=download&id={file['id']}"
-                      
-                      result = {
-                          'success': True,
-                          'status': 'completed',
-                          'downloadUrl': download_url,
-                          'viewUrl': file['webViewLink'],
-                          'filesCount': len(downloaded),
-                          'totalFiles': len(images),
-                          'fileSize': zip_size,
-                          'fileSizeMB': round(zip_size / 1024 / 1024, 2)
-                      }
-                      
-                      print(f"Uploaded! Download: {download_url}")
-                      
-                  except Exception as e:
-                      print(f"Google Drive error: {e}")
-                      result = {'success': False, 'status': 'failed', 'error': str(e)}
+              # Кодируем в base64
+              with open(zip_path, 'rb') as f:
+                  zip_base64 = base64.b64encode(f.read()).decode('utf-8')
+              
+              result = {
+                  'success': True,
+                  'status': 'completed',
+                  'fileName': f'{FOLDER_NAME}.zip',
+                  'filesCount': len(downloaded),
+                  'totalFiles': len(images),
+                  'fileSize': zip_size,
+                  'fileSizeMB': round(zip_size / 1024 / 1024, 2)
+              }
+              
+              print(f"ZIP encoded, size: {len(zip_base64)} chars")
 
-          # Сохраняем результат в тот же Gist
-          print("Saving result to Gist...")
+          # Сохраняем в Gist
+          print("Saving to Gist...")
+          files_to_update = {
+              'result.json': {'content': json.dumps(result, indent=2)}
+          }
+          
+          if zip_base64:
+              files_to_update['archive.zip.b64'] = {'content': zip_base64}
+          
           update_resp = requests.patch(
               f'https://api.github.com/gists/{GIST_ID}',
               headers=headers,
-              json={
-                  'files': {
-                      'result.json': {
-                          'content': json.dumps(result, indent=2)
-                      }
-                  }
-              }
+              json={'files': files_to_update}
           )
           
           if update_resp.status_code == 200:
-              print("Result saved to Gist")
+              print("Saved to Gist!")
           else:
-              print(f"Failed to update Gist: {update_resp.status_code}")
+              print(f"Failed: {update_resp.status_code} - {update_resp.text[:500]}")
 
           print("\n=== RESULT ===")
           print(json.dumps(result, indent=2))
           EOF
-
-      - name: Upload artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: images-zip
-          path: /tmp/*.zip
-          retention-days: 1
-          if-no-files-found: ignore
